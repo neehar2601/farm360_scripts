@@ -1,0 +1,84 @@
+# Farm360 reverse proxy (Caddy) — single public entrypoint.
+#
+# Native EC2 (no Docker):  ./docker/run-caddy-native.sh
+# Upstreams default to localhost; override via env (e.g. in docker-compose use service names):
+#   AUTH_UPSTREAM=auth-service:4000  FARM_UPSTREAM=farm-service:4001 ...
+#
+# Route map (prefixes do not overlap):
+#   /auth /admin /uploads                  -> auth-service    :4000
+#   /farm                                  -> farm-service    :4001
+#   /workers /attendance /finance          -> worker-service  :4002
+#   /api/sp                                -> sp-service      :4003
+#   everything else                        -> frontend        :5173
+#
+# Because the browser only ever talks to ONE origin, CORS does not apply and
+# the backend ports (4000-4003, 5173) never need to be exposed publicly.
+{
+	# Plain HTTP while testing on a bare IP. When you have a domain, replace the
+	# ":80" site address below with the domain name and open 80+443: Caddy then
+	# obtains and renews HTTPS certificates automatically.
+	auto_https off
+}
+
+(farm360_api) {
+	handle /auth/* {
+		reverse_proxy {$AUTH_UPSTREAM:localhost:4000}
+	}
+	handle /admin/* {
+		reverse_proxy {$AUTH_UPSTREAM:localhost:4000}
+	}
+	handle /uploads/* {
+		reverse_proxy {$AUTH_UPSTREAM:localhost:4000}
+	}
+	handle /api/sp/* {
+		reverse_proxy {$SP_UPSTREAM:localhost:4003}
+	}
+
+	# For overlapping paths (/farm/*, /workers*, etc.):
+	# If the request asks for HTML (browser navigation / page reload), fall through to frontend.
+	# Otherwise, route to the backend microservice.
+	@farm_api {
+		path /farm/*
+		not header Accept *text/html*
+	}
+	handle @farm_api {
+		reverse_proxy {$FARM_UPSTREAM:localhost:4001}
+	}
+
+	@worker_api {
+		path /workers* /attendance* /finance*
+		not header Accept *text/html*
+	}
+	handle @worker_api {
+		reverse_proxy {$WORKER_UPSTREAM:localhost:4002}
+	}
+}
+
+# ── Main app (farmer / service-provider frontend) ─────────────────────────────
+:80 {
+	encode gzip
+	import farm360_api
+
+	# Frontend (Vite dev server started by ./start.sh; HMR websocket is proxied too).
+	handle {
+		reverse_proxy {$FRONTEND_UPSTREAM:localhost:5173}
+	}
+
+	# For a production build instead, run `npm run build` in farm360_frontend and
+	# replace the handle block above with:
+	#   handle {
+	#       root * /home/ubuntu/farm360/farm360_frontend/dist
+	#       try_files {path} /index.html
+	#       file_server
+	#   }
+}
+
+# ── Admin portal (optional second port — restrict it to your IP in the SG) ────
+:8081 {
+	encode gzip
+	import farm360_api
+
+	handle {
+		reverse_proxy {$ADMIN_UPSTREAM:localhost:5174}
+	}
+}
