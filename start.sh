@@ -18,6 +18,7 @@ DB_DIR="$SCRIPT_DIR/farm360_db"
 AUTH_DIR="$SCRIPT_DIR/farm360_backend/auth-service"
 FARM_DIR="$SCRIPT_DIR/farm360_backend/farm-service"
 WORKER_DIR="$SCRIPT_DIR/farm360_backend/worker-service"
+SP_DIR="$SCRIPT_DIR/farm360_backend/sp-service"
 FRONTEND_DIR="$SCRIPT_DIR/farm360_frontend"
 ADMIN_DIR="$SCRIPT_DIR/farm360_admin"
 LOGS_DIR="$SCRIPT_DIR/.logs"
@@ -27,6 +28,7 @@ PID_FILE="$LOGS_DIR/farm360.pids"
 AUTH_PORT=4000
 FARM_PORT=4001
 WORKER_PORT=4002
+SP_PORT=4003
 FRONTEND_PORT=5173
 ADMIN_PORT=5174
 
@@ -45,12 +47,14 @@ SKIP_MIGRATIONS=false
 PROD_MODE=false
 STOP_MODE=false
 RESTART_MODE=false
+START_CADDY=true
 for arg in "$@"; do
   case "$arg" in
     --skip-migrations) SKIP_MIGRATIONS=true ;;
     --prod)            PROD_MODE=true ;;
     --stop)            STOP_MODE=true ;;
     --restart)         RESTART_MODE=true ;;
+    --no-caddy)        START_CADDY=false ;;
   esac
 done
 
@@ -80,8 +84,13 @@ stop_all() {
     rm -f "$PID_FILE"
   fi
 
+  # Stop Caddy reverse proxy if running
+  if [ -f "$SCRIPT_DIR/docker/run-caddy-native.sh" ]; then
+    "$SCRIPT_DIR/docker/run-caddy-native.sh" --stop >/dev/null 2>&1 || true
+  fi
+
   # Fallback: kill anything still on our ports
-  for port in "$AUTH_PORT" "$FARM_PORT" "$WORKER_PORT" "$FRONTEND_PORT"; do
+  for port in "$AUTH_PORT" "$FARM_PORT" "$WORKER_PORT" "$SP_PORT" "$FRONTEND_PORT" "$ADMIN_PORT"; do
     local pids_on_port
     pids_on_port=$(lsof -ti ":${port}" 2>/dev/null || true)
     if [ -n "$pids_on_port" ]; then
@@ -202,7 +211,7 @@ fi
 # Port conflict detection
 echo ""
 CONFLICTS=false
-for svc_info in "${AUTH_PORT}:auth-service" "${FARM_PORT}:farm-service" "${WORKER_PORT}:worker-service" "${FRONTEND_PORT}:frontend"; do
+for svc_info in "${AUTH_PORT}:auth-service" "${FARM_PORT}:farm-service" "${WORKER_PORT}:worker-service" "${SP_PORT}:sp-service" "${FRONTEND_PORT}:frontend"; do
   svc_port="${svc_info%%:*}"
   svc_name="${svc_info##*:}"
   if port_in_use "$svc_port"; then
@@ -210,7 +219,21 @@ for svc_info in "${AUTH_PORT}:auth-service" "${FARM_PORT}:farm-service" "${WORKE
     CONFLICTS=true
   fi
 done
-$CONFLICTS || success "All ports are free (:${AUTH_PORT}, :${FARM_PORT}, :${WORKER_PORT}, :${FRONTEND_PORT})"
+$CONFLICTS || success "All ports are free (:${AUTH_PORT}, :${FARM_PORT}, :${WORKER_PORT}, :${SP_PORT}, :${FRONTEND_PORT})"
+
+# Service-provider DB (isolated from the farmer DB). Created once via
+# farm360_backend/sp-service/scripts/setup-db.sh (needs a postgres superuser).
+SP_DB_NAME="${SP_DB_NAME:-farm360_sp}"
+SP_DB_READY=false
+if command -v psql &>/dev/null; then
+  if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT_PG" -U "$DB_USER" -d "$SP_DB_NAME" -c '\q' >/dev/null 2>&1; then
+    SP_DB_READY=true
+    success "Service-provider DB reachable (${SP_DB_NAME})"
+  else
+    warn "Database '${SP_DB_NAME}' not found — sp-service will be skipped"
+    warn "Create it once with: ${BOLD}./farm360_db/sp/setup-db.sh${RESET}"
+  fi
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — Database migrations
@@ -240,6 +263,16 @@ else
   fi
 
   success "Database schema is up to date"
+
+  if $SP_DB_READY; then
+    SP_MIGRATION_OUTPUT=$(cd "$DB_DIR/sp" && node migrate.js 2>&1)
+    echo "$SP_MIGRATION_OUTPUT" >> "$MIGRATION_LOG"
+    if echo "$SP_MIGRATION_OUTPUT" | grep -qE "❌|FAILED|Fatal error"; then
+      error "Service-provider migration failed — check ${MIGRATION_LOG}"
+      exit 1
+    fi
+    success "Service-provider schema is up to date"
+  fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +294,14 @@ wait_for_port  "farm-service"   "$FARM_PORT"
 # Worker service
 start_service "worker-service" "$WORKER_DIR" "$NPM_CMD"
 wait_for_port  "worker-service" "$WORKER_PORT"
+
+# Service-provider service (own DB + own identity; non-fatal if DB not set up yet)
+if $SP_DB_READY; then
+  start_service "sp-service" "$SP_DIR" "$NPM_CMD"
+  wait_for_port  "sp-service" "$SP_PORT" || warn "sp-service failed to start — other services are unaffected"
+else
+  warn "Skipping sp-service (database not set up)"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 4 — Start frontend (last, after all APIs are healthy)
@@ -310,23 +351,47 @@ echo -e "${RESET}"
 success "Admin portal is up  →  http://localhost:${ADMIN_PORT}"
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  STEP 6 — Start Caddy reverse proxy (ports 80 & 8081)
+# ══════════════════════════════════════════════════════════════════════════════
+section "REVERSE PROXY (CADDY)"
+
+CADDY_RUNNING=false
+if $START_CADDY; then
+  if [ -x "$SCRIPT_DIR/docker/run-caddy-native.sh" ]; then
+    "$SCRIPT_DIR/docker/run-caddy-native.sh" && CADDY_RUNNING=true || warn "Caddy failed to start; services remain accessible on localhost ports."
+  else
+    warn "docker/run-caddy-native.sh not executable or not found"
+  fi
+else
+  warn "Skipping Caddy (--no-caddy flag specified)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ALL SYSTEMS GO — script exits here, services keep running in the background
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${RESET}"
 echo -e "${GREEN}${BOLD}│           🌱  farm360 is fully running!  🌱             │${RESET}"
 echo -e "${GREEN}${BOLD}├─────────────────────────────────────────────────────────┤${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  Auth Service    →  ${CYAN}http://localhost:${AUTH_PORT}${RESET}               ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  Farm Service    →  ${CYAN}http://localhost:${FARM_PORT}${RESET}               ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  Worker Service  →  ${CYAN}http://localhost:${WORKER_PORT}${RESET}               ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  Frontend        →  ${CYAN}http://localhost:${FRONTEND_PORT}${RESET}               ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  Admin Portal    →  ${CYAN}http://localhost:${ADMIN_PORT}${RESET}               ${GREEN}${BOLD}│${RESET}"
+if $CADDY_RUNNING; then
+echo -e "${GREEN}${BOLD}│${RESET}  ${BOLD}Public Gateways (Caddy):${RESET}                               ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    App           →  ${CYAN}http://localhost/${RESET} (port 80)           ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    Admin Portal  →  ${CYAN}http://localhost:8081/${RESET}                ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}                                                         ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}  ${DIM}Internal Services (bound to 127.0.0.1):${RESET}                ${GREEN}${BOLD}│${RESET}"
+fi
+echo -e "${GREEN}${BOLD}│${RESET}    Auth Service  →  ${DIM}http://127.0.0.1:${AUTH_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    Farm Service  →  ${DIM}http://127.0.0.1:${FARM_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    Worker Service→  ${DIM}http://127.0.0.1:${WORKER_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
+$SP_DB_READY && echo -e "${GREEN}${BOLD}│${RESET}    SP Service    →  ${DIM}http://127.0.0.1:${SP_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    Frontend      →  ${DIM}http://127.0.0.1:${FRONTEND_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}    Admin Portal  →  ${DIM}http://127.0.0.1:${ADMIN_PORT}${RESET}                  ${GREEN}${BOLD}│${RESET}"
 echo -e "${GREEN}${BOLD}│${RESET}                                                         ${GREEN}${BOLD}│${RESET}"
 echo -e "${GREEN}${BOLD}│${RESET}  Logs  →  ${DIM}.logs/<service>.log${RESET}                           ${GREEN}${BOLD}│${RESET}"
 echo -e "${GREEN}${BOLD}│${RESET}  PIDs  →  ${DIM}.logs/farm360.pids${RESET}                            ${GREEN}${BOLD}│${RESET}"
 echo -e "${GREEN}${BOLD}│${RESET}                                                         ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  ${DIM}./start.sh --stop     stop all services${RESET}                ${GREEN}${BOLD}│${RESET}"
-echo -e "${GREEN}${BOLD}│${RESET}  ${DIM}./start.sh --restart  restart all services${RESET}             ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}  ${DIM}./start.sh --stop     stop all services + Caddy${RESET}        ${GREEN}${BOLD}│${RESET}"
+echo -e "${GREEN}${BOLD}│${RESET}  ${DIM}./start.sh --restart  restart all services + Caddy${RESET}     ${GREEN}${BOLD}│${RESET}"
 echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${RESET}"
 echo ""
 
