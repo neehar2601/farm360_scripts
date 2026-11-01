@@ -73,12 +73,13 @@ stop_all() {
   local silent="${1:-false}"
   $silent || echo -e "\n${YELLOW}${BOLD}⛔  Stopping all farm360 services…${RESET}"
 
-  # Kill saved PIDs first
+  # Kill saved PIDs (and their entire process groups)
   if [ -f "$PID_FILE" ]; then
     while IFS= read -r pid; do
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         $silent || echo -e "  ${DIM}Killing PID $pid${RESET}"
-        kill "$pid" 2>/dev/null || true
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
       fi
     done < "$PID_FILE"
     rm -f "$PID_FILE"
@@ -89,13 +90,18 @@ stop_all() {
     "$SCRIPT_DIR/docker/run-caddy-native.sh" --stop >/dev/null 2>&1 || true
   fi
 
-  # Fallback: kill anything still on our ports
+  # Fallback: kill anything still on our ports (including parent nodemon)
   for port in "$AUTH_PORT" "$FARM_PORT" "$WORKER_PORT" "$SP_PORT" "$FRONTEND_PORT" "$ADMIN_PORT"; do
     local pids_on_port
     pids_on_port=$(lsof -ti ":${port}" 2>/dev/null || true)
     if [ -n "$pids_on_port" ]; then
       $silent || echo -e "  ${DIM}Killing leftover process(es) on :${port}${RESET}"
-      kill $pids_on_port 2>/dev/null || true
+      for p in $pids_on_port; do
+        local ppid
+        ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+        [ -n "$ppid" ] && [ "$ppid" -gt 1 ] && kill -9 "$ppid" 2>/dev/null || true
+        kill -9 "$p" 2>/dev/null || true
+      done
     fi
   done
 
