@@ -1,0 +1,147 @@
+# Farm360 Production Stack: docker compose up --build
+# Requires a .env file (see .env.docker.example).
+# Database is external (AWS RDS PostgreSQL or external EC2 instance).
+# Caddy acts as the single reverse proxy gateway on ports 80, 443, and 8081.
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  # To ship container stdout to CloudWatch on AWS instead, use:
+  #   logging: { driver: awslogs, options: { awslogs-region: ap-south-1, awslogs-group: /farm360/production, awslogs-create-group: "true" } }
+
+x-db-env: &db-env
+  DB_HOST: ${DB_HOST:?set DB_HOST in .env (RDS endpoint or EC2 IP)}
+  DB_PORT: ${DB_PORT:-5432}
+  DB_USER: ${DB_USER:-farm360}
+  DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+
+x-log-env: &log-env
+  LOG_FORMAT: json
+  CLOUDWATCH_ENABLED: ${CLOUDWATCH_ENABLED:-false}
+  AWS_REGION: ${AWS_REGION:-ap-south-1}
+  CLOUDWATCH_LOG_GROUP: ${CLOUDWATCH_LOG_GROUP:-/farm360/production}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+
+services:
+  # ── One-shot database migration runner against external DB ───────────────────
+  migrate:
+    build: ./farm360_db
+    restart: "no"
+    environment:
+      <<: *db-env
+      DB_NAME: ${DB_NAME:-farm360}
+      SP_DB_NAME: ${SP_DB_NAME:-farm360_sp}
+
+  # ── Reverse Proxy / Public Gateway (Caddy) ──────────────────────────────────
+  caddy:
+    image: caddy:2.11-alpine
+    <<: *common
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8081"   # Admin Portal (restrict inbound to your IP in security group)
+    environment:
+      AUTH_UPSTREAM: auth-service:4000
+      FARM_UPSTREAM: farm-service:4001
+      WORKER_UPSTREAM: worker-service:4002
+      SP_UPSTREAM: sp-service:4003
+      FRONTEND_UPSTREAM: frontend:80
+      ADMIN_UPSTREAM: admin:80
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - auth-service
+      - farm-service
+      - worker-service
+      - sp-service
+      - frontend
+      - admin
+
+  # ── Frontend SPA ────────────────────────────────────────────────────────────
+  frontend:
+    build: ./farm360_frontend
+    <<: *common
+    # No host ports published: internal to Docker network, routed via Caddy (:80)
+
+  # ── Admin Portal SPA ────────────────────────────────────────────────────────
+  admin:
+    build: ./farm360_admin
+    <<: *common
+    # No host ports published: internal to Docker network, routed via Caddy (:8081)
+
+  # ── Microservices (internal only, no direct host ports) ─────────────────────
+  auth-service:
+    build: ./farm360_backend/auth-service
+    <<: *common
+    environment:
+      <<: [*db-env, *log-env]
+      SERVICE_NAME: auth-service
+      DB_NAME: ${DB_NAME:-farm360}
+      JWT_SECRET: ${JWT_SECRET:?}
+      REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:?}
+      SUPER_ADMIN_SECRET: ${SUPER_ADMIN_SECRET:?}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    volumes:
+      - auth_uploads:/app/uploads
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  farm-service:
+    build: ./farm360_backend/farm-service
+    <<: *common
+    environment:
+      <<: [*db-env, *log-env]
+      SERVICE_NAME: farm-service
+      DB_NAME: ${DB_NAME:-farm360}
+      JWT_SECRET: ${JWT_SECRET:?}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker-service:
+    build: ./farm360_backend/worker-service
+    <<: *common
+    environment:
+      <<: [*db-env, *log-env]
+      SERVICE_NAME: worker-service
+      DB_NAME: ${DB_NAME:-farm360}
+      JWT_SECRET: ${JWT_SECRET:?}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  sp-service:
+    build: ./farm360_backend/sp-service
+    <<: *common
+    environment:
+      <<: [*db-env, *log-env]
+      SERVICE_NAME: sp-service
+      DB_NAME: ${SP_DB_NAME:-farm360_sp}
+      JWT_SECRET: ${JWT_SECRET:?}
+      SP_JWT_SECRET: ${SP_JWT_SECRET:?}
+      SP_REFRESH_TOKEN_SECRET: ${SP_REFRESH_TOKEN_SECRET:?}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+      FARM_SERVICE_URL: http://farm-service:4001
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      farm-service: { condition: service_healthy }
+
+volumes:
+  auth_uploads:
+  caddy_data:
+  caddy_config:
