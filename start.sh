@@ -253,8 +253,8 @@ else
   mkdir -p "$LOGS_DIR"
 
   # Run migration status + apply, capturing output to log only
-  (cd "$DB_DIR" && node run_migrations.js --status 2>&1) >> "$MIGRATION_LOG"
-  MIGRATION_OUTPUT=$(cd "$DB_DIR" && node run_migrations.js 2>&1)
+  (cd "$DB_DIR" && node run_migrations.js --status 2>&1 || true) >> "$MIGRATION_LOG"
+  MIGRATION_OUTPUT=$(cd "$DB_DIR" && node run_migrations.js 2>&1 || true)
   echo "$MIGRATION_OUTPUT" >> "$MIGRATION_LOG"
 
   if echo "$MIGRATION_OUTPUT" | grep -qE "❌|FAILED|Fatal error"; then
@@ -265,7 +265,7 @@ else
   success "Database schema is up to date"
 
   if $SP_DB_READY; then
-    SP_MIGRATION_OUTPUT=$(cd "$DB_DIR/sp" && node migrate.js 2>&1)
+    SP_MIGRATION_OUTPUT=$(cd "$DB_DIR/sp" && node migrate.js 2>&1 || true)
     echo "$SP_MIGRATION_OUTPUT" >> "$MIGRATION_LOG"
     if echo "$SP_MIGRATION_OUTPUT" | grep -qE "❌|FAILED|Fatal error"; then
       error "Service-provider migration failed — check ${MIGRATION_LOG}"
