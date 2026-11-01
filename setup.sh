@@ -54,6 +54,8 @@ as_user() {
     "$@"
   fi
 }
+# Wait for the user (skipped when not running in a terminal)
+pause() { if [ -t 0 ]; then read -r -p "  $1 " _; else warn "Non-interactive shell — continuing without pausing"; fi; }
 
 if   command -v apt-get >/dev/null; then PM=apt
 elif command -v dnf     >/dev/null; then PM=dnf
@@ -65,15 +67,11 @@ step "System packages"
 case "$PM" in
   apt)
     $SUDO apt-get update -y
-    $SUDO apt-get install -y curl ca-certificates gnupg lsof iproute2 build-essential \
-      postgresql postgresql-contrib ;;
+    $SUDO apt-get install -y curl ca-certificates gnupg lsof iproute2 build-essential ;;
   dnf)
-    $SUDO dnf install -y curl ca-certificates lsof iproute gcc-c++ make \
-      postgresql-server postgresql-contrib
-    [ -d /var/lib/pgsql/data/base ] || $SUDO postgresql-setup --initdb ;;
+    $SUDO dnf install -y curl ca-certificates lsof iproute gcc-c++ make ;;
   pacman)
-    $SUDO pacman -Sy --noconfirm --needed curl lsof iproute2 base-devel postgresql
-    [ -d /var/lib/postgres/data/base ] || as_postgres initdb -D /var/lib/postgres/data ;;
+    $SUDO pacman -Sy --noconfirm --needed curl lsof iproute2 base-devel ;;
 esac
 ok "System packages installed"
 
@@ -94,32 +92,51 @@ else
   ok "Installed Node.js $(node -v) / npm $(npm -v)"
 fi
 
-# ── 3. PostgreSQL service + databases ─────────────────────────────────────────
+# ── 3. PostgreSQL (install only; user creates role + databases) ───────────────
 step "PostgreSQL"
-$SUDO systemctl enable --now postgresql 2>/dev/null || $SUDO service postgresql start || \
+if command -v psql >/dev/null; then
+  ok "PostgreSQL client found: $(psql --version)"
+else
+  case "$PM" in
+    apt) $SUDO apt-get install -y postgresql postgresql-contrib ;;
+    dnf) $SUDO dnf install -y postgresql-server postgresql-contrib
+         [ -d /var/lib/pgsql/data/base ] || $SUDO postgresql-setup --initdb ;;
+    pacman) $SUDO pacman -S --noconfirm --needed postgresql
+            [ -d /var/lib/postgres/data/base ] || as_postgres initdb -D /var/lib/postgres/data ;;
+  esac
+  ok "Installed $(psql --version)"
+fi
+
+$SUDO systemctl enable --now postgresql 2>/dev/null || $SUDO service postgresql start 2>/dev/null || \
   warn "Could not start PostgreSQL automatically — start it manually"
 
-for _ in $(seq 1 15); do
-  as_postgres psql -tAc "SELECT 1" >/dev/null 2>&1 && break
-  sleep 1
-done
-pg() { as_postgres psql -v ON_ERROR_STOP=1 "$@"; }
+cat <<EOF
 
-if pg -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
-  pg -c "ALTER ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}';" >/dev/null
-  ok "Role ${DB_USER} exists (password synced)"
-else
-  pg -c "CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}';" >/dev/null
-  ok "Created role ${DB_USER}"
-fi
-for db in "$DB_NAME" "$SP_DB_NAME"; do
-  if pg -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" | grep -q 1; then
-    ok "Database ${db} exists"
-  else
-    pg -c "CREATE DATABASE ${db} OWNER ${DB_USER};" >/dev/null
-    ok "Created database ${db}"
-  fi
-done
+$(echo -e "\033[1;36m")  ▶ MANUAL STEP — create the PostgreSQL user and databases$(echo -e "\033[0m")
+
+  Open a NEW terminal and run:
+
+    sudo -u postgres psql
+
+  Then paste (choose your own user/password/DB names):
+
+    CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD 'your_password';
+    CREATE DATABASE ${DB_NAME}    OWNER ${DB_USER};   -- farmer / worker / auth data
+    CREATE DATABASE ${SP_DB_NAME} OWNER ${DB_USER};   -- service-provider data
+    \\q
+
+  Verify the login works:
+
+    PGPASSWORD='your_password' psql -h localhost -U ${DB_USER} -d ${DB_NAME} -c '\\q'
+
+  Note: start.sh reads DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD /
+  SP_DB_NAME from your shell (defaults: ${DB_NAME} / ${DB_USER} / farmsync@360).
+  If you pick different values, export them before running start.sh, e.g.
+
+    export DB_NAME=mydb DB_USER=myuser DB_PASSWORD='your_password'
+
+EOF
+pause "Press Enter once the user and databases are created…"
 
 # ── 3b. Ownership + layout fixes ──────────────────────────────────────────────
 step "Project ownership & layout"
@@ -141,17 +158,35 @@ fi
 
 # ── 4. .env files ─────────────────────────────────────────────────────────────
 step ".env files"
-for dir in farm360_db farm360_backend/auth-service farm360_backend/farm-service \
-           farm360_backend/worker-service farm360_backend/sp-service; do
+ENV_DIRS=(farm360_db farm360_backend/auth-service farm360_backend/farm-service \
+          farm360_backend/worker-service farm360_backend/sp-service)
+for dir in "${ENV_DIRS[@]}"; do
   if [ -f "$ROOT/$dir/.env" ]; then
     ok "$dir/.env present"
   elif [ -f "$ROOT/$dir/.env.example" ]; then
     as_user cp "$ROOT/$dir/.env.example" "$ROOT/$dir/.env"
-    warn "Created $dir/.env from .env.example — review the values"
+    warn "Created $dir/.env from .env.example"
   else
-    warn "$dir has no .env or .env.example"
+    warn "$dir has no .env or .env.example — create one manually"
   fi
 done
+
+echo -e "\n\033[1;36m  ▶ MANUAL STEP — update the DB settings in these .env files:\033[0m"
+for dir in "${ENV_DIRS[@]}"; do echo "    $ROOT/$dir/.env"; done
+cat <<EOF
+
+  Set in each file (match what you created in PostgreSQL):
+
+    DB_HOST=localhost
+    DB_PORT=5432
+    DB_NAME=<database>        (sp-service uses ${SP_DB_NAME})
+    DB_USER=<your db user>
+    DB_PASSWORD=<your password>
+
+  Example:  nano $ROOT/farm360_backend/auth-service/.env
+
+EOF
+pause "Press Enter once the .env files are updated…"
 
 # ── 5. npm dependencies ───────────────────────────────────────────────────────
 step "npm dependencies"
