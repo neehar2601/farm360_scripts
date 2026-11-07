@@ -13,9 +13,11 @@ NODE_MAJOR="${NODE_MAJOR:-20}"
 
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
-DB_NAME="${DB_NAME:-farm360}"
 DB_USER="${DB_USER:-farm360}"
 DB_PASSWORD="${DB_PASSWORD:-farmsync@360}"
+AUTH_DB_NAME="${AUTH_DB_NAME:-farm360_auth}"
+FARM_DB_NAME="${FARM_DB_NAME:-farm360_farm}"
+WORKER_DB_NAME="${WORKER_DB_NAME:-farm360_worker}"
 SP_DB_NAME="${SP_DB_NAME:-farm360_sp}"
 
 NODE_PROJECTS=(
@@ -112,31 +114,28 @@ $SUDO systemctl enable --now postgresql 2>/dev/null || $SUDO service postgresql 
 
 cat <<EOF
 
-$(echo -e "\033[1;36m")  ▶ MANUAL STEP — create the PostgreSQL user and databases$(echo -e "\033[0m")
+$(echo -e "\033[1;36m")  ▶ MANUAL STEP — create the PostgreSQL user and 4 decentralized databases$(echo -e "\033[0m")
 
   Open a NEW terminal and run:
 
+    ./farm360_db/setup-db.sh
+
+  Or manually via psql:
+
     sudo -u postgres psql
-
-  Then paste (choose your own user/password/DB names):
-
-    CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD 'your_password';
-    CREATE DATABASE ${DB_NAME}    OWNER ${DB_USER};   -- farmer / worker / auth data
-    CREATE DATABASE ${SP_DB_NAME} OWNER ${DB_USER};   -- service-provider data
+    CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD 'your_password' CREATEDB;
+    CREATE DATABASE ${AUTH_DB_NAME}   OWNER ${DB_USER};   -- auth-service (:4000)
+    CREATE DATABASE ${FARM_DB_NAME}   OWNER ${DB_USER};   -- farm-service (:4001)
+    CREATE DATABASE ${WORKER_DB_NAME} OWNER ${DB_USER};   -- worker-service (:4002)
+    CREATE DATABASE ${SP_DB_NAME}     OWNER ${DB_USER};   -- sp-service (:4003)
     \\q
 
   Verify the login works:
 
-    PGPASSWORD='your_password' psql -h localhost -U ${DB_USER} -d ${DB_NAME} -c '\\q'
-
-  Note: start.sh reads DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD /
-  SP_DB_NAME from your shell (defaults: ${DB_NAME} / ${DB_USER} / farmsync@360).
-  If you pick different values, export them before running start.sh, e.g.
-
-    export DB_NAME=mydb DB_USER=myuser DB_PASSWORD='your_password'
+    PGPASSWORD='your_password' psql -h localhost -U ${DB_USER} -d ${AUTH_DB_NAME} -c '\\q'
 
 EOF
-pause "Press Enter once the user and databases are created…"
+pause "Press Enter once the user and 4 databases are created…"
 
 # ── 3b. Ownership + layout fixes ──────────────────────────────────────────────
 step "Project ownership & layout"

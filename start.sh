@@ -198,20 +198,33 @@ success "Node.js $NODE_VER"
 # PostgreSQL connectivity check using DB_DIR env
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT_PG="${DB_PORT:-5432}"
-DB_NAME="${DB_NAME:-farm360}"
 DB_USER="${DB_USER:-farm360}"
 DB_PASSWORD="${DB_PASSWORD:-farmsync@360}"
+AUTH_DB_NAME="${AUTH_DB_NAME:-farm360_auth}"
+FARM_DB_NAME="${FARM_DB_NAME:-farm360_farm}"
+WORKER_DB_NAME="${WORKER_DB_NAME:-farm360_worker}"
+SP_DB_NAME="${SP_DB_NAME:-farm360_sp}"
 
+SP_DB_READY=false
 if command -v psql &>/dev/null; then
-  if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT_PG" -U "$DB_USER" -d "$DB_NAME" -c '\q' >/dev/null 2>&1; then
-    success "PostgreSQL reachable at ${DB_HOST}:${DB_PORT_PG}/${DB_NAME}"
-  else
-    error "Cannot connect to PostgreSQL at ${DB_HOST}:${DB_PORT_PG}/${DB_NAME}"
-    error "Make sure PostgreSQL is running and credentials are correct."
+  MISSING_DBS=()
+  for target_db in "$AUTH_DB_NAME" "$FARM_DB_NAME" "$WORKER_DB_NAME" "$SP_DB_NAME"; do
+    if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT_PG" -U "$DB_USER" -d "$target_db" -c '\q' >/dev/null 2>&1; then
+      success "PostgreSQL reachable at ${DB_HOST}:${DB_PORT_PG}/${target_db}"
+      [ "$target_db" = "$SP_DB_NAME" ] && SP_DB_READY=true
+    else
+      MISSING_DBS+=("$target_db")
+    fi
+  done
+
+  if [ "${#MISSING_DBS[@]}" -gt 0 ]; then
+    error "Missing or unreachable database(s): ${MISSING_DBS[*]}"
+    error "Run once in your terminal: ${BOLD}./farm360_db/setup-db.sh${RESET}"
     exit 1
   fi
 else
   warn "psql not in PATH — skipping DB reachability check"
+  SP_DB_READY=true
 fi
 
 # Port conflict detection
@@ -227,22 +240,8 @@ for svc_info in "${AUTH_PORT}:auth-service" "${FARM_PORT}:farm-service" "${WORKE
 done
 $CONFLICTS || success "All ports are free (:${AUTH_PORT}, :${FARM_PORT}, :${WORKER_PORT}, :${SP_PORT}, :${FRONTEND_PORT})"
 
-# Service-provider DB (isolated from the farmer DB). Created once via
-# farm360_backend/sp-service/scripts/setup-db.sh (needs a postgres superuser).
-SP_DB_NAME="${SP_DB_NAME:-farm360_sp}"
-SP_DB_READY=false
-if command -v psql &>/dev/null; then
-  if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT_PG" -U "$DB_USER" -d "$SP_DB_NAME" -c '\q' >/dev/null 2>&1; then
-    SP_DB_READY=true
-    success "Service-provider DB reachable (${SP_DB_NAME})"
-  else
-    warn "Database '${SP_DB_NAME}' not found — sp-service will be skipped"
-    warn "Create it once with: ${BOLD}./farm360_db/sp/setup-db.sh${RESET}"
-  fi
-fi
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 2 — Database migrations
+#  STEP 2 — Database migrations (Auth, Farm, Worker, SP)
 # ══════════════════════════════════════════════════════════════════════════════
 section "DATABASE MIGRATIONS"
 
@@ -253,12 +252,12 @@ else
     error "Migration runner not found at $DB_DIR/run_migrations.js"; exit 1
   fi
 
-  log "Checking and applying migrations …"
+  log "Checking and applying migrations across all 4 databases …"
 
   MIGRATION_LOG="${LOGS_DIR}/migrations.log"
   mkdir -p "$LOGS_DIR"
 
-  # Run migration status + apply, capturing output to log only
+  # Run migration status + apply across farm360_auth, farm360_farm, farm360_worker, farm360_sp
   (cd "$DB_DIR" && node run_migrations.js --status 2>&1 || true) >> "$MIGRATION_LOG"
   MIGRATION_OUTPUT=$(cd "$DB_DIR" && node run_migrations.js 2>&1 || true)
   echo "$MIGRATION_OUTPUT" >> "$MIGRATION_LOG"
@@ -268,17 +267,7 @@ else
     exit 1
   fi
 
-  success "Database schema is up to date"
-
-  if $SP_DB_READY; then
-    SP_MIGRATION_OUTPUT=$(cd "$DB_DIR/sp" && node migrate.js 2>&1 || true)
-    echo "$SP_MIGRATION_OUTPUT" >> "$MIGRATION_LOG"
-    if echo "$SP_MIGRATION_OUTPUT" | grep -qE "❌|FAILED|Fatal error"; then
-      error "Service-provider migration failed — check ${MIGRATION_LOG}"
-      exit 1
-    fi
-    success "Service-provider schema is up to date"
-  fi
+  success "All 4 service database schemas are up to date"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════

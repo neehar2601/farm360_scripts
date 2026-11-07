@@ -34,6 +34,11 @@
 		reverse_proxy {$SP_UPSTREAM:localhost:4003}
 	}
 
+	# Service-to-service endpoints are never public (token-protected, but also blocked here)
+	handle /farm/internal/* {
+		respond 404
+	}
+
 	# For overlapping paths (/farm/*, /workers*, etc.):
 	# If the request asks for HTML (browser navigation / page reload), fall through to frontend.
 	# Otherwise, route to the backend microservice.
