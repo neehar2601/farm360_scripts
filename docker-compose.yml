@@ -5,6 +5,8 @@
 
 x-common: &common
   restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   logging:
     driver: json-file
     options: { max-size: "10m", max-file: "3" }
@@ -26,14 +28,28 @@ x-log-env: &log-env
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
 
 services:
+  # ── Transparent proxy to host machine's PostgreSQL ──────────────────────────
+  db-proxy:
+    image: alpine/socat
+    restart: unless-stopped
+    network_mode: host
+    command: tcp-listen:5433,fork,reuseaddr tcp:127.0.0.1:5432
+
   # ── One-shot database migration runner against external DB ───────────────────
   migrate:
     build: ./farm360_db
     restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       <<: *db-env
-      DB_NAME: ${DB_NAME:-farm360}
+      AUTH_DB_NAME: ${AUTH_DB_NAME:-farm360_auth}
+      FARM_DB_NAME: ${FARM_DB_NAME:-farm360_farm}
+      WORKER_DB_NAME: ${WORKER_DB_NAME:-farm360_worker}
       SP_DB_NAME: ${SP_DB_NAME:-farm360_sp}
+    depends_on:
+      db-proxy:
+        condition: service_started
 
   # ── Reverse Proxy / Public Gateway (Caddy) ──────────────────────────────────
   caddy:
@@ -81,7 +97,10 @@ services:
     environment:
       <<: [*db-env, *log-env]
       SERVICE_NAME: auth-service
-      DB_NAME: ${DB_NAME:-farm360}
+      DB_NAME: ${AUTH_DB_NAME:-farm360_auth}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+      FARM_SERVICE_URL: http://farm-service:4001
+      WORKER_SERVICE_URL: http://worker-service:4002
       JWT_SECRET: ${JWT_SECRET:?}
       REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:?}
       SUPER_ADMIN_SECRET: ${SUPER_ADMIN_SECRET:?}
@@ -101,7 +120,8 @@ services:
     environment:
       <<: [*db-env, *log-env]
       SERVICE_NAME: farm-service
-      DB_NAME: ${DB_NAME:-farm360}
+      DB_NAME: ${FARM_DB_NAME:-farm360_farm}
+      WORKER_SERVICE_URL: http://worker-service:4002
       JWT_SECRET: ${JWT_SECRET:?}
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
@@ -114,7 +134,9 @@ services:
     environment:
       <<: [*db-env, *log-env]
       SERVICE_NAME: worker-service
-      DB_NAME: ${DB_NAME:-farm360}
+      DB_NAME: ${WORKER_DB_NAME:-farm360_worker}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?}
+      FARM_SERVICE_URL: http://farm-service:4001
       JWT_SECRET: ${JWT_SECRET:?}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
     depends_on:
